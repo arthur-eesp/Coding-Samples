@@ -2,6 +2,6 @@
 
 ## Arthur Schwerz
 
-This repository contains some examples of code used for various assignments throughout my masters in economics (still in progress). I've organised the repository in files according to the programming language used. 
+This repository contains the data and simulation files used in (and created by) the code sample on [this page](https://arthur-eesp.github.io/Coding-Samples/).
 
-Apart from the raw code files, I have also included .pdf documents briefly describing the econometric methods being used (for R and Stata) or the macroeconomic model being solved (for Python) in each case.
+While R Markdown documents provide a useful interface to present text and code simultaneously, when doing research it is more common to write scripts separately and then incorporate the results in a separate text document. Hence, I also include in this repository R scripts that reproduce the code in the coding sample above, and a .pdf file (written in LaTeX) with the corresponding text, with both the explanations of the econometric methods being used and the output of the scripts.
