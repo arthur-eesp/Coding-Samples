@@ -1,4 +1,4 @@
-# Coding Samples
+# Coding Sample
 
 ## Arthur Schwerz
 
