@@ -1,0 +1,655 @@
+---
+title:  |
+  | Coding Sample
+  | Power and Inference Methods in an RCT
+author: "Arthur Schwerz"
+output: 
+  prettydoc::html_pretty:
+    number_sections: yes
+    toc: yes
+    theme: cayman
+    highlight: github
+bibliography: "bib-PI.bib"
+---
+
+\newcommand{\P}{\mathbb{P}}
+\newcommand{\hyp}{\mathcal{H}}
+\newcommand{\Y}{\mathbf{Y}}
+\newcommand{\T}{\mathbf{T}}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(eval = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+
+@Bruhn2016 study the impact of a high school financial education program through a randomized control trial. For this coding sample, I'll estimate the power of their experimental design, assess the inference of their analysis, and use alternative inference methods.
+
+Studying the inference in @Bruhn2016 can be particularly instructive because their analysis suffers from the issue described in @Chaisemartin2019 for paired experiments: clustering standard errors at the school level can lead to a biased estimator as it does not take into account the perfect negative correlation in treatment status between students of different schools in the same pair of matched schools. Hence, assessing inference and using alternative inference methods in advance could have helped raise a red flag that the inference was unreliable.
+
+To facilitate reproducibility, I have saved the data and simulation files used in this coding sample on [this repository](https://github.com/arthur-eesp/Coding-Samples).
+
+
+
+# Minimum Detectable Effect
+
+The power of a hypothesis test is the probability, for a given effect size and statistical significance, that the null hypothesis is rejected when it is false. Usually, the null hypothesis of interest is $\hyp_0: \beta = 0$, i.e., to test whether there is no effect, and in this case low power corresponds to a high probability of not rejecting the null even when the true effect $\bar \beta$ is different from zero, resulting in an inconclusive answer. The design of an experiment (e.g., sample size and treatment allocation) can affect power, so researchers should take power calculations into account in the design phase to try to ensure the experiment will have enough power to identify effects that can be of interest.^[See @Duflo2007 for more discussion on sample size, design, and the power of experiments.]
+
+In this exercise, I'll assume I'm on the design phase of the experiment from @Bruhn2016 and wish to estimate the power of the design; for brevity, I'll focus on the power for estimating the effects on passing, failing and dropout rates (table 4). Note that calculating the power of the test requires knowledge of the distribution of the estimator (at least asymptotically), which naturally isn't available before the experiment is conducted. However, if data from before the program is implemented is available, as is the case here, one can use it to approximate the distribution of the estimator (or some feature of it), and then calculate an approximation for the power either analytically or through simulations.
+
+To estimate the power of the design for different possible values of true effects, I'll run simulations using school administrative data from 2009. First, I fix a grid of possible effects and a significance of $\alpha = 5\%$.^[Note that standard errors are not clustered for table 4 (the data is already at the school level), so the inference issue highlighted in the introduction should not present here and I'll assume the nominal size of the test is correct. Later I'll discuss one way to assess inference that can be used even in the design phase to evaluate the reliability of an inference method.] Then, for each value $\bar \beta$ in this grid, I simulate the experiment: randomly assign treatment at the school-pair level, and for the treated units define the outcome as if $\bar \beta$ was the true effect. For each simulation, I run the regression on treatment status and find the corresponding p-value.^[I do not include controls because I'm using the controls to estimate power (and the authors do not provide data for earlier years). However, it's worth noting that, in the paper, results are very similar when including covariates for this table.] With that, I can find the fraction of tests that were rejected across all simulations, which gives an approximation of the power of the design for each given effect value $\bar \beta$.
+
+```{r}
+library(data.table)
+library(haven)
+library(fixest)
+library(ggplot2)
+
+# Set percentage of CPU cores to use
+setDTthreads(percent=75)
+setFixest_nthreads(.75)
+
+# Read the data from the .dta file
+dt_admin <- read_dta('Data/school_admin_data_final.dta', encoding = 'latin1')
+setDT(dt_admin)
+
+# Having a look at the data
+summary(dt_admin)
+```
+
+The baseline and outcome variables are `aprovao____` (passing rate), `reprovao____` (failing rate) and `abandono____` (dropout rate) for years 2009 and 2011, respectively, both at the grade level. `cd_escola` and `pair_all` are school and school match identifiers.
+
+Since for this exercise I'm assuming we are still at the design stage, I'll remove treatment and outcome variables. I'll also remove schools with missing values for the baseline and schools that ended up with no match.
+
+```{r}
+# Remove outcomes
+dt_mde <- copy(dt_admin)
+dt_mde[, c('aprovao2011', 'reprovao2011', 'abandono2011') := NULL]
+
+# Remove rows with any missing value 
+missing_values <- apply(is.na(dt_mde), 1, any)
+dt_mde <- dt_mde[!missing_values]
+
+# Get number of schools per match and remove unmatched schools
+dt_mde[, num_match := uniqueN(cd_escola), by = pair_all]
+dt_mde <- dt_mde[num_match > 1]
+
+# Get number of treated schools per match
+dt_mde[, treat_match := sum(treatment), by = pair_all]
+
+# Remove final treatment dummy
+dt_mde[, treatment := NULL]
+
+# Checking every match has at least 1 control and 1 treatment
+cat('Number of rows with treat_match >= num_match:',
+      sum(dt_mde[treat_match >= num_match]))
+```
+
+Now we move on to the simulations themselves. As it is common in the literature to measure effects in terms of standard deviations, the grid of possible effects $\bar \beta$ will be in terms of the standard deviation $\sigma$. Moreover, similar papers had previously found effects of magnitudes up to $0.2 \sigma$, so the possible effect values $\bar \beta$ for which I'll calculate the power will be around that value: $0.03 \sigma, 0.06 \sigma, ..., 0.3 \sigma$.^[I chose this effect grid for this exercise for simplicity, but in practice researchers should make this choice very carefully, taking into account the particular setting being studied. See, for example, [this](https://blogs.worldbank.org/impactevaluations/did-you-do-your-power-calculations-using-standard-deviations-do-them-again) post for some discussion on calculating in absolute terms versus in terms of standard deviations.] I'll create the artificial outcome by treating those effects as constants and including them additively, always in the "positive outcome" direction (increase pass rate, reduce fail and dropout rate).
+
+```{r eval=FALSE}
+# NOTE: this code chunk is slow.
+# The rmarkdown file by default does not run this chunk and instead loads the
+# saved output. See comments after this code chunk.
+
+# Set parameters for simulations
+reps  <- 5000L                        # Number of simulations
+alpha <- 0.05                         # Significance level
+eff_grid <- seq(0.03, 0.3, by = 0.03) # Effect grid
+
+# Create matrix to store power estimates
+vars <- c('aprovao2009', 'reprovao2009', 'abandono2009')
+power_tbl <- matrix(nrow = length(eff_grid), ncol = length(vars))
+colnames(power_tbl) <- vars
+
+for (var in vars){
+  # Create matrix to store p-values
+  pvalues <- matrix(nrow = reps, ncol = length(eff_grid))
+  
+  # Get std.dev. of variable
+  sigma <- sd(dt_mde[, ..var][[1]])
+  
+  # Set random seed
+  set.seed(0)
+  
+  # Change effect grid to reflect positive outcome
+  ifelse(var == 'aprovao2009',
+         eff_grid <- abs(eff_grid),
+         eff_grid <- -abs(eff_grid))
+  
+  for (i in seq_len(reps)){
+    # Randomize treatment assignment, respecting matches and number of treated
+    # schools per match
+    dt_mde[, treat := ifelse(cd_escola %in% sample(cd_escola, treat_match), 1, 0),
+           by = pair_all]
+    
+    for (j in seq_along(eff_grid)){
+      # Create artificial outcome (in terms of std.dev.)
+      dt_mde[, y := get(var) + sigma * eff_grid[j] * treat]
+      
+      # Run the regression (including match fixed effects)
+      model <- feols(y ~ treat | pair_all,
+                     data = dt_mde,
+                     se = "hetero", 
+                     lean = TRUE)
+      
+      # Save p-value
+      pvalues[i,j] <- pvalue(model)['treat']
+    }
+  }
+  # Save p-value matrix so no need to rerun this part of the code later
+  saveRDS(pvalues, file = paste0('Simulations/MDE_', var, '.RDS'))
+  
+  # Calculate power based rejection rate from simulated p-values and save it
+  power_tbl[, var] <- apply(pvalues, 2, function(x) mean(x < alpha))
+}
+
+# Save power table and effect grid
+saveRDS(power_tbl, file = 'Simulations/MDE_power_tbl.RDS')
+saveRDS(abs(eff_grid), file = 'Simulations/MDE_eff_grid.RDS')
+```
+
+I have saved simulation files for 5000 simulations on [this repository](https://github.com/arthur-eesp/Coding-Samples), in case someone would like to run the code below without needing to run the above chunk with that many simulations (which may take a little while). Another option would be to run the chunk above with fewer simulations (be sure to create a folder called `Simulations` in the working directory to save the output); note that the p-values for a smaller number of simulations $N$ (e.g., 10 or 100) should (hopefully) match the first $N$ simulations in those files for 5000 simulations because the code above sets a random seed for randomizing treatment.
+
+```{r}
+# Load power table and effect grid from files
+power_tbl <- readRDS('Simulations/MDE_power_tbl.RDS')
+eff_grid <- readRDS('Simulations/MDE_eff_grid.RDS')
+
+# Create data.table from power table and include effect grid
+dt_plot <- data.table(cbind(effect = abs(eff_grid), power_tbl))
+
+# Transform in long format (more convenient for plotting)
+dt_plot <- melt(dt_plot, id.vars = c('effect'),
+             measure.vars = c('aprovao2009', 'reprovao2009', 'abandono2009'))
+
+# Plot using ggplot
+ggplot(dt_plot, aes(x=effect, y=value, group = variable,
+                    colour = variable, shape = variable)) + 
+  geom_line() +
+  geom_point(size = 2) + 
+  geom_hline(linetype='dashed', yintercept = .8) + 
+  ggtitle('Power functions') + 
+  xlab('Effect as proportion of std.dev.') + 
+  ylab('Power')
+```
+
+The graph shows that, with a significance level of $5\%$, the approximate power of the design is at least the typical value of $80\%$ for effects above $0.15$ standard deviations. In other words, the probability of not rejecting the null if the true effect is $\bar \beta > 0.15 \sigma$ is below $20\%$.
+
+As highlighted above, these calculations are necessarily approximations, but they are still useful to give an idea of what magnitudes of effects one may have enough power to detect in an experimental design.
+
+
+
+# Assessing inference through simulations
+
+Statistical inference is often used to control for false-positive results; for instance, in case we estimated a positive effect, we want to ensure that the probability of estimating a zero effect (given the uncertainty inherent in the estimation) is low enough so that we are sufficiently confident the true effect is indeed positive. However, inference may sometimes be based on incorrect or unreliable methods, potentially leading to an excess of false-positives. @Ferman2021 proposes different ways to assess inference using simulations to evaluate its reliability.
+
+For this exercise, I'll assess how reliable is the hypothesis test used in @Bruhn2016 to tell if a result is statistically significant. More precisely: does the test $\hyp_0: \beta = 0$ truly have the desired nominal significance level (e.g., $10\%, 5\%, 1\%$)? The idea will be to run simulations in which we replace the outcome by resampling i.i.d. standard normal variables (so that the null hypothesis is satisfied by construction), and then verify if the size of the test is correct, i.e., if for a test with a nominal size of $\alpha$ the rejection rate is (approximately) $\alpha$.
+
+As emphasized in @Ferman2021, the use of i.i.d. standard normal variables does not mean we believe the errors are normal or independent (in fact, it is likely errors are correlated within schools, for example). But if the inference method turns out to be unreliable even in such a simple setting, that should at least raise a red flag that something might be wrong with inference.
+
+
+## Replicating the original table
+
+For brevity, I'll focus on table 7 of @Bruhn2016, which shows their estimates of the impact of the financial education program on student purchasing behavior (the use of cash/debit card, credit card or installments to buy consumer items) across survey rounds.^[In the experiment, the researchers conducted two follow-up surveys, one 4 months after the start of the program (to study short-term impacts) and the other over a year later (to study longer-term impacts), apart from a baseline survey conducted before the start of the program.] Moreover, I'll focus specifically on their final specification (panel C): with school pair dummies, controlling for baseline dependent variable and student gender, and with standard errors clustered at the school level. First, I'll ensure I can replicate the results found by the authors.
+
+```{r}
+# Replicating table 7 in Bruhn et. al. (2016)
+
+# Clean environment
+rm(list = ls())
+
+
+#=== Preparing the data ===#
+
+# Read the data from the .dta file
+dt <- read_dta('Data/school_intervention_panel_final.dta', encoding = 'latin1')
+setDT(dt)
+
+# Select only the variables we are interested in
+vars <- c(
+  'cd_escola', 'treatment', 'round', 'pair_all',
+  'dumm_rp88__92AB_fup', 'dumm_rp88__92C_fup', 'dumm_rp88__92D_fup', # Outcomes
+  'dumm_rp88__92AB_bl', 'dumm_rp88__92C_bl', 'dumm_rp88__92D_bl',    # Baseline
+  'female_coded'
+)
+dt <- dt[, ..vars]
+
+# Let's change the names of some variables for readability
+vars <- c(
+  'school_id', 'treatment', 'round', 'pair_all',
+  'cash', 'credit', 'installment',          # Outcomes
+  'cash_bl', 'credit_bl', 'installment_bl', # Baseline
+  'female_coded'
+)
+colnames(dt) <- vars
+
+# Remove schools with NA as treatment status (it's only one)
+dt <- dt[!is.na(treatment)]
+
+# For each baseline variable, create dummy to indicate if value is missing and
+# replace original NA value by 0
+base_vars <- vars[grep('_bl', vars)]
+for (var in base_vars){
+  dt[, paste0('miss_', var) := ifelse(is.na(get(var)), 1, 0)]
+  dt[is.na(get(var)), (var) := 0]
+}
+
+# Create school pair dummies following paper's description and the file
+# `analysis_final.do` provided by the authors
+outcomes <- c('cash', 'credit', 'installment')
+for (var in outcomes){
+  for (i in c(0,1)){
+    # To check if the remaining observations after removing NAs in the outcome
+    # variable leads to only treatment or only control schools in the match,
+    # we create a variable called `flag` which is the mean treatment status of
+    # the remaining observations; if it's 1 or 0, then all observations remaining 
+    # in the match are either treatment or control.
+    dt[!is.na(get(var)) & (round == i), flag := mean(treatment), by = pair_all]
+    
+    # Instead of dropping these observations (when including match fixed effects)
+    # we group these matches with no corresponding control/treatment in a common
+    # dummy (pair_all = 0), keeping the original match for the others
+    dt[, paste0('pair_', var, i) := ifelse( (flag == 1) | (flag == 0),
+                                            0, 
+                                            pair_all)]
+  }
+}
+dt[, flag := NULL]
+
+# Save this prepared data.table for later
+saveRDS(dt, file = 'Data/dt_table7.RDS')
+
+
+#=== Estimation ===#
+
+# Create empty list to store models
+models <- list()
+  
+for (var in outcomes){
+  for (i in c(0,1)){
+    # Create formula controlling for baseline and gender, and include school f.e.
+    fml <- as.formula(paste0(var,
+                             '~treatment+',
+                             paste0(var, '_bl+'), paste0('miss_', var, '_bl+'),
+                             'as.factor(female_coded) |',
+                             paste0('pair_', var, i)
+                             ))
+    
+    # Run regression, clustering s.e. at school level, and save model
+    model <- feols(fml, data = dt[round == i], cluster = ~school_id, lean = TRUE)
+    models[[paste0(var, '_fu', i+1)]] <- model
+  }
+}
+
+# Save original models for later
+saveRDS(models, file = 'Data/models_replication_table7.RDS')
+
+
+#=== Create regression table ===#
+
+library(modelsummary)
+library(kableExtra)
+
+# Select which fit statistics to include
+gm <- list(
+  list("raw" = "nobs", "clean" = "Num.obs.", "fmt" = 0),
+  list("raw" = "r.squared", "clean" = "R2", "fmt" = 3)
+)
+
+# Rename variables
+names(models) <- rep(c('Follow-up 1', 'Follow-up 2'), 3)
+
+# Create and customize table using `modelsummary`
+modelsummary(models,
+             statistic = c('std.error',
+                           'p = {p.value}'),
+             stars = c("***"=0.01, "**"=0.05, "*"=0.10),
+             gof_map = gm,
+             coef_map = 'treatment',
+             title = 'Replication of table 7: student purchasing behavior.',
+             notes = 'Standard errors clustered by school_id.'
+             ) %>%
+  kable_styling() %>%
+  add_header_above(c(" " = 1, "Cash" = 2, "Credit" = 2, "Installment" = 2))
+```
+
+Yay for reproducibility! (Although, admittedly, that part on creating the dummies was a bit convoluted)
+
+
+## Assessment 
+
+With that out of the way, we move to the assessment itself. I'll run several simulations in which I replace those outcomes by resampling i.i.d. standard normal variables. For each simulation, I follow the same estimation procedure as above, then record the p-values to test $\hyp_0: \beta = 0$ at a nominal significance level of $\alpha = 5\%$. Finally, I'll calculate the rejection rate across all the simulations; since the null is satisfied by construction (on average), if the inference method is reliable we should expect a rate close to $\alpha = 5\%$.
+
+```{r eval=FALSE}
+# NOTE: this code chunk is slow.
+# The rmarkdown file by default does not run this chunk and instead loads the
+# saved output. See comments after this code chunk.
+
+# Set parameters for simulations
+reps <- 5000L # Number of simulations
+alpha <- 0.05 # Significance
+
+# Create vector with separate outcomes for 1st and 2nd follow-up
+outcomes <- c('cash', 'credit', 'installment')
+outcomes_all <- c(rbind(paste0(outcomes, '_fu1'),
+                        paste0(outcomes, '_fu2')))
+
+# Create matrix to store p-values
+pvalues <- matrix(nrow = reps, ncol = length(outcomes_all))
+colnames(pvalues) <- outcomes_all
+
+# Turn off messages from `fixest` package
+setFixest_notes(FALSE)
+
+# Set random seed
+set.seed(1)
+
+for (rep in seq_len(reps)){
+  # Create iid standard normal variables
+  dt[, norm_vars := rnorm(nrow(dt))]
+  for (v in seq_along(outcomes)){
+    var <- outcomes[v]
+    for (i in c(0,1)){
+      # Create formula controlling for baseline and gender, and include school f.e.
+      fml <- as.formula(paste0('norm_vars~treatment+',
+                               paste0(var, '_bl+'), paste0('miss_', var, '_bl+'),
+                               'as.factor(female_coded) | ',
+                               paste0('pair_', var, i)
+                               ))
+      
+      # Run regression as if iid normal variables were outcome
+      model <- feols(fml, data = dt[(round == i) & (!is.na(get(var)))],
+                     cluster = ~school_id, lean = TRUE)
+      
+      # Save p-value
+      pvalues[rep, (2*v-1)+i] <- pvalue(model)['treatment']
+    }
+  }
+}
+
+# Save p-values across simulations
+saveRDS(pvalues, file = 'Simulations/assess_pvalues.RDS')
+
+# Calculate rejection rate for given significance and save in a matrix
+rejection_rate <- matrix(nrow = 1, ncol = length(outcomes_all))
+colnames(rejection_rate) <- outcomes_all
+
+rejection_rate[1,] <- apply(pvalues, 2, function(x) mean(x < alpha))
+
+saveRDS(rejection_rate, file = 'Simulations/assess_rejection_rate.RDS')
+```
+
+Just like I did for the simulations for estimating power, I have saved the simulation files resulting from this assessment on [this repository](https://github.com/arthur-eesp/Coding-Samples), since the code above similarly takes some time to run.
+
+```{r}
+# Load rejection rate table from file
+rejection_rate <- readRDS('Simulations/assess_rejection_rate.RDS')
+
+# Print table
+rejection_rate %>%
+  kbl(caption = 'Assessment: rejection rates for nominal $\\alpha=5\\%$ test.',
+      col.names = rep(c('Follow-up 1', 'Follow-up 2'), 3),
+      digits = 3
+      ) %>%
+  kable_styling(full_width = FALSE) %>%
+  add_header_above(c("Cash" = 2, "Credit" = 2, "Installment" = 2))
+```
+The table above shows that a nominal size $5\%$ test using the same inference method as the paper has a rejection rate far above that value across the simulations with i.i.d. standard normal values, which strongly suggests something might be wrong with inference.
+
+Of course, because of @Chaisemartin2019, presently we already know what the issue was: since it does not take into account the perfect correlation of treatment status within pairs, the variance estimator with school-level clusters may be biased, especially if fixed effects are included (as is the case here). Nevertheless, this exercise serves to illustrate how these assessments could help raise red flags to applied researchers that there might be problems with inference.^[It's worth noting that, even though this particular assessment (resampling i.i.d. normal variables) was able to point out there might be an issue for this particular setting, sometimes this method is too simple to detect problems. For example, when using difference-in-differences, estimation issues may arise as a result of not appropriately accounting for serial correlation, and an assessment based on i.i.d. variables would not detect such problems. See @Ferman2021 for other types of assessments, including discussions on their advantages and disadvantages.]
+
+Now I'll discuss two alternative inference methods: randomization inference and wild cluster bootstrapping. Each approach has different assumptions and properties, but if they are appropriate for the empirical setting at hand, they can be useful to conduct inference when the more standard methods seem unreliable, or to add robustness to the results.
+
+Before that, @Chaisemartin2019 propose a way to account for the within-match correlation which was causing problems: cluster at the match level rather than at the school level. The authors show that this leads to an unbiased estimator for the variance of the treatment effect estimator if treatment effects are homogeneous, and conservative otherwise. The table below re-estimates table 7 using match-clustered variance, so that we can compare with the results when using alternative inference methods. Observe that, as expected, the p-values increase considerably, which reduces the significance of the results (but at least the results which were previously significant remain significant at a $5\%$ level).
+
+```{r}
+# Read prepared data and create vector of outcomes
+dt <- readRDS('Data/dt_table7.RDS')
+outcomes <- c('cash', 'credit', 'installment')
+
+# Create empty list to store models
+new_models <- list()
+  
+for (var in outcomes){
+  for (i in c(0,1)){
+    # Create formula controlling for baseline and gender, and include school f.e.
+    fml <- as.formula(paste0(var,
+                             '~treatment+',
+                             paste0(var, '_bl+'), paste0('miss_', var, '_bl+'),
+                             'as.factor(female_coded) |',
+                             paste0('pair_', var, i)
+                             ))
+    
+    # Run regression, clustering at match level, and save model
+    model <- feols(fml,
+                   data = dt[round == i],
+                   cluster = as.formula(paste0('~pair_', var, i)),
+                   lean = FALSE)
+    new_models[[paste0(var, '_fu', i+1)]] <- model
+  }
+}
+
+# Select which fit statistics to include
+gm <- list(
+  list("raw" = "nobs", "clean" = "Num.obs.", "fmt" = 0),
+  list("raw" = "r.squared", "clean" = "R2", "fmt" = 3)
+)
+
+# Rename variables
+names(new_models) <- rep(c('Follow-up 1', 'Follow-up 2'), 3)
+
+# Create and customize table using `modelsummary`
+modelsummary(new_models,
+             statistic = c('std.error',
+                           'p = {p.value}'),
+             stars = c("***"=0.01, "**"=0.05, "*"=0.10),
+             gof_map = gm,
+             coef_map = 'treatment',
+             title = 'Re-estimating table 7 with school match clusters.',
+             notes = 'Standard errors clustered by pair_all (school match identifier).'
+             ) %>%
+  kable_styling() %>%
+  add_header_above(c(" " = 1, "Cash" = 2, "Credit" = 2, "Installment" = 2))
+```
+
+
+# Randomization Inference
+
+The basic idea of randomization inference (also known as permutation test) is to treat potential outcomes $Y_i(1)$ and $Y_i(0)$ as non-stochastic, so the only source of uncertainty in the observed outcome $Y_i = Y_i(1) T_i + Y_i(0) (1 - T_i)$ comes from the treatment status, which was randomized. In that case, under a sharp null hypothesis of the form $\hyp_0: Y_i(0) = Y_i(1)$ for all $i$, it is possible to derive the \textbf{exact} distribution of a test statistic $t(\T, \Y)$ under the null with no need to impose parametric assumptions, since the values of all non-observed potential outcomes are known.
+    
+With that, that same test statistic $t(\tilde{\T}, \Y)$ can be calculated for all possible alternative assignments $\tilde{\T}$, and the p-value of the permutation test is defined as the proportion of $t(\tilde{\T}, \Y)$ greater (in absolute value) than $t(\T, \Y)$.^[Technically, to obtain a test of exactly a given size, one should use $\geq$ rather than $>$ for the permutation test (possibly randomizing in the case of equality to obtain the desired test size). However, since the number of clusters is large, that is unlikely to make a difference here. Besides, using $>$ simply gives a potentially more conservative test.]$^{,}$ ^[For a more thorough introduction to randomization reference, see chapter 5 of @Imbens2015.]
+    
+For this exercise, I'll use randomization inference for the results presented in table 7. Note that the permutations must respect the design of the experiment, i.e., they consist only of switching treatment status within matches (to respect the pairwise matching design). Moreover, since the number of permutations is too large, I'll draw a large sample of permutations rather than use all of them.
+
+Finally, the test statistic I'll use is the absolute value of the estimator itself: $t = |\hat \beta|$. The estimator for the p-value will be given by
+\[
+\hat p = \frac{1}{R} \sum_{r=1}^R \mathbf{1} \{|\hat{\beta^r}| > |\hat \beta| \},
+\]
+where $\mathbf{1}$ denotes the indicator function, $R$ the number of permutations in the sample, and $\hat \beta^r$ is the estimated coefficient for permutation $r$.
+
+```{r eval=FALSE}
+# NOTE: this code chunk is very slow (with 10k permutations)
+# The rmarkdown file by default does not run this chunk and instead loads the
+# saved output. See comments after this code chunk.
+
+# Clean environment
+rm(list = ls())
+
+# Read prepared data and original models for table 7
+dt_ri <- readRDS('Data/dt_table7.RDS')
+models <- readRDS('Data/models_replication_table7.RDS')
+
+# Get original coefficients
+orig_coefs <- sapply(models, function(x) coef(x)['treatment'])
+
+# Get num. of schools per match, num. of students per school and num. of treated
+# schools per match (used to create permutations)
+dt_ri[, num_match := uniqueN(school_id), by = pair_all]
+dt_ri[, num_students := .N, by = school_id]
+dt_ri[, treat_match := sum(treatment/num_students), by = pair_all]
+
+# Set size of sample of permutations
+reps <- 10000L 
+
+# Create vector with separate outcomes for 1st and 2nd follow-up
+outcomes <- c('cash', 'credit', 'installment')
+outcomes_all <- c(rbind(paste0(outcomes, '_fu1'),
+                        paste0(outcomes, '_fu2')))
+
+# Create matrix to store tests across permutations
+ri_test <- matrix(nrow = reps, ncol = length(outcomes_all))
+colnames(ri_test) <- outcomes_all
+
+# Turn off messages from `fixest` package
+setFixest_notes(FALSE)
+
+# Set random seed
+set.seed(2)
+
+for (rep in seq_len(reps)){
+  # Create a random permutation of treatment assignment
+  dt_ri[, treatment := ifelse(school_id %in% sample(school_id, treat_match), 1, 0),
+        by = pair_all]
+  
+  # Also randomize treatment assignment for unmatched schools (it's only one)
+  # (they are included in the pool of unmatched schools, with pair_all = 0)
+  dt_ri[num_match == 1, treatment := sample(c(1,0), 1), by = school_id]
+  
+  for (v in seq_along(outcomes)){
+    var <- outcomes[v]
+    for (i in c(0,1)){
+      # Repeat the dummy creation process, as done when replicating table 7
+      # (needed because of the few schools matched with more than 1 other school)
+      dt_ri[!is.na(get(var)) & (round == i), flag := mean(treatment), by = pair_all]
+      dt_ri[, paste0('pair_', var, i) := ifelse( (flag == 1) | (flag == 0),
+                                                 0, 
+                                                 pair_all)]
+      
+      # Create formula controlling for baseline and gender, and include school f.e.
+      fml <- as.formula(paste0(var,
+                               '~treatment+',
+                               paste0(var, '_bl+'), paste0('miss_', var, '_bl+'),
+                               'as.factor(female_coded) | ',
+                               paste0('pair_', var, i)
+      ))
+      
+      # Run regression as before
+      model <- feols(fml, data = dt_ri[round == i], cluster = ~school_id,
+                     lean = TRUE)
+      
+      # Check if permutation estimate is greater than original estimate (in 
+      # absolute terms) then save result
+      tmp <- abs(coef(model)['treatment']) > abs(orig_coefs[[(2*v-1)+i]])
+      ri_test[rep, (2*v-1)+i] <- tmp
+      
+      rm(fml, model, tmp)
+    }
+  }
+}
+
+# Save matrix of tests across permutations
+saveRDS(ri_test, file = 'Simulations/rand_inf_tests.RDS')
+
+# Calculate randomization inference p-values save in a matrix
+ri_pvalues <- matrix(nrow = 1, ncol = length(outcomes_all))
+colnames(ri_pvalues) <- outcomes_all
+
+ri_pvalues[1,] <- apply(ri_test, 2, mean)
+
+saveRDS(ri_pvalues, file = 'Simulations/rand_inf_pvalues.RDS')
+```
+
+The output of the chunk above is available at [this repository](https://github.com/arthur-eesp/Coding-Samples), together with the results of the other simulations. As before, it should be possible to compare the first few lines of the matrix `rand_inf_tests.RDS` to one generated using fewer permutations because I set a seed for randomization.^[Important note: RStudio sometimes generates a stack imbalance error when running the code above which may lead it to crash ([similar to this](https://github.com/rstudio/rstudio/issues/1786)), especially if the number of permutations is large. But the code runs without errors when running directly via RGui (the standard graphical user interface that usually comes with R).]
+
+```{r}
+# Load rejection rate table from file
+ri_pvalues <- readRDS('Simulations/rand_inf_pvalues.RDS')
+
+# Print and customize table
+ri_pvalues %>%
+  kbl(caption = 'Randomization inference p-values',
+      col.names = rep(c('Follow-up 1', 'Follow-up 2'), 3),
+      digits = 3
+      ) %>%
+  kable_styling(full_width = FALSE) %>%
+  add_header_above(c("Cash" = 2, "Credit" = 2, "Installment" = 2))
+```
+Compared with the original estimation table, the p-values also increase considerably and are closer to the p-values obtained when using match-level clusters (if somewhat larger), again suggesting the original inference method could be unreliable. One important caveat when using randomization inference is that the null hypothesis being tested is sharp, rather than the usual null of zero average treatment effect.^[There are ways to make permutation tests comparable to the usual test of null average effect. For example, @Zhao2021 show that using studentized statistics (dividing the estimate by the variance) when conducting permutation tests may result in asymptotically valid inference for the usual null of zero average treatment effect. Nevertheless, I used the unstudentized statistic here because the original variance estimator (with school-level clusters) is biased.]
+
+
+
+# Wild cluster bootstrap
+
+Bootstrapping is an often used tool for inference, especially when parametric inference is challenging or one is unsure if the assumptions it requires are satisfied. The general idea of bootstrapping is to i.i.d. resample (with replacement) from the empirical distribution and then conduct estimation in each such sample (these are called bootstrap samples). One can then check how extreme is the original test statistic when compared to the distribution of bootstrap test statistics (the calculated statistic for each bootstrap sample), and then use that to calculate the bootstrap p-value.
+
+The wild bootstrap is a particular kind of bootstrap in which the bootstrap samples are obtained from the residuals. For example, for a simple linear model $Y_i = \mathbf{X}_i' \beta + \varepsilon_i$, one can generate wild bootstrap observations $Y^*_i$ by multiplying the error term by an i.i.d. variable $\xi^*$ with mean 0 and variance one: $Y_i^* = \mathbf{X}_i' \hat{\beta} + \xi^*_i \hat{\varepsilon_i}$. A common choice for $\xi^*$ is the Rademacher distribution ($\P[\xi^* = 1] = \frac{1}{2}$ and $\P[\xi^* = -1] = \frac{1}{2}$). The wild cluster bootstrap can be obtained similarly, by holding fixed not only the regressors, but also the clusters.^[Bootstrapping is a huge (and sometimes complicated) topic, so I only described it very briefly here (I'm not sure that I know enough about the subject to discuss it much more profoundly, anyway). But one can easily find general introductions to the method in many Econometrics textbooks; I personally like @Hansen21.]
+
+Here I'll use the `fwildclusterboot` package (@Fischer21) to conduct wild cluster bootstrapping. As noted by @Roodman2019, one of the advantages of this method is that, in many cases, the algorithm to implement it is extremely fast (high computational costs are often a downside to bootstrapping methods). Moreover, it may work even in settings when standard large-sample asymptotic theory provides unreliable inference. However, it's worth noting that the wild cluster bootstrap, like other resampling inference methods, still relies on asymptotic theory, so one must be careful when using it to conduct inference with few clusters; see, for example, @Canay2021.
+
+Fortunately, in this exercise we probably won't need to worry much about that, given the large number of observations and clusters in @Bruhn2016. Indeed, the issues with inference seem related to a biased variance estimator rather than bad asymptotic approximations.
+
+```{r}
+library(fwildclusterboot)
+
+# Clean environment
+rm(list = ls())
+
+# Read prepared data and create vector of outcomes
+dt <- readRDS('Data/dt_table7.RDS')
+outcomes <- c('cash', 'credit', 'installment')
+
+# Create empty list to store bootstrap objects
+boot_inf <- list()
+
+for (var in outcomes){
+  for (i in c(0,1)){
+    # Create formula controlling for baseline and gender, and include school f.e.
+    fml <- as.formula(paste0(var,
+                             '~treatment+',
+                             paste0(var, '_bl+'), paste0('miss_', var, '_bl+'),
+                             'as.factor(female_coded) |',
+                             paste0('pair_', var, i)
+                             ))
+    
+    # Create separate data.table to run regression
+    # (to better interact with the `boottest` function later)
+    dt_tmp <- dt[(round == i) & !is.na(get(var))]
+    
+    # Run regression (without cluster), apply `boottest` and then save result
+    model <- feols(fml, data = dt_tmp, lean = TRUE)
+
+    boot <- boottest(model,
+                     B = 9999,
+                     param = 'treatment',
+                     clustid = 'school_id',
+                     seed = 0,
+                     nthreads = 0.75)
+
+    boot_inf[[paste0(var, '_fu', i+1)]] <- boot
+  }
+}
+
+# Rename variables
+names(boot_inf) <- rep(c('Follow-up 1', 'Follow-up 2'), 3)
+
+# Create and customize table using `modelsummary`
+modelsummary(boot_inf,
+             output = 'kableExtra',
+             statistic = 'p = {p.value}',
+             stars = c("***"=0.01, "**"=0.05, "*"=0.10),
+             gof_map = list(),
+             estimate = 'estimate',
+             coef_rename = c("1*treatment = 0" = 'treatment'),
+             title = 'P-values for table 7 from wild cluster bootstrapping.'
+             ) %>%
+  kable_styling() %>%
+  add_header_above(c(" " = 1, "Cash" = 2, "Credit" = 2, "Installment" = 2))
+```
+
+As we can see, the p-values obtained from the wild cluster bootstrap are remarkably close to the p-values obtained when clustering at the match level, and thus noticeably larger than the original p-values. Hence, again this illustrates how using alternative inference methods (if they are appropriate to the context) can be useful to indicate potential problems with standard inference methods, or potentially show that results are robust to different approaches.
+
+
+# References
