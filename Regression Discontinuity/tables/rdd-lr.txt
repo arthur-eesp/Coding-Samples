@@ -1,0 +1,36 @@
+
+Selected window = [0.479;0.521] 
+
+Running randomization-based test...
+Randomization-based test complete. 
+
+Running sensitivity analysis...
+Sensitivity analysis complete.
+
+
+Number of obs     =           411
+Order of poly     =             0
+Kernel type       =       uniform
+Reps              =          1000
+Window            =   set by user
+H0:          tau  =         0.000
+Randomization     = fixed margins
+
+Cutoff c =    0.500   Left of c  Right of c
+      Number of obs         189         222
+ Eff. number of obs          11           8
+    Mean of outcome       0.510       0.630
+    S.d. of outcome       0.112       0.080
+             Window       0.479       0.521
+
+================================================================================
+                                  Finite sample            Large sample         
+                               ------------------  -----------------------------
+          Statistic          T        P>|T|        P>|T|    Power vs d =   0.056
+================================================================================
+     Diff. in means      0.120        0.015        0.007                   0.245
+ Kolmogorov-Smirnov      0.693        0.010        0.013                      NA
+    Rank sum z-stat     -2.642        0.005        0.008                   0.169
+================================================================================
+
+95% confidence interval: [0.03,0.21]
